@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Attendance Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div>
+        <h1>Attendance Dashboard</h1>
+        <p class="subtitle">ESP32-S3 &amp; Raspberry Pi 5</p>
+      </div>
+      <a href="/logout" class="btn-logout">Logout</a>
+    </div>
+  </header>
+
+  <main class="dashboard-container">
+
+    <!-- Summary bar -->
+    <div class="summary-bar">
+      <span class="summary-date">📅 {{ today }}</span>
+      <span class="summary-count">
+        {{ filter_str }} records: <strong>{{ total }}</strong>
+      </span>
+      <div class="filter-btns">
+        {% if show_all %}
+          <a href="/" class="btn-secondary">Today Only</a>
+          <span class="btn-primary active">All Records</span>
+        {% else %}
+          <span class="btn-primary active">Today</span>
+          <a href="/?all=1" class="btn-secondary">All Records</a>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Attendance table -->
+    {% if records %}
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Student ID</th>
+            <th>Full Name</th>
+            <th>Date</th>
+            <th>Time</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for record in records %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td>{{ record['student_id'] }}</td>
+            <td>{{ record['full_name'] }}</td>
+            <td>{{ record['date'] }}</td>
+            <td>{{ record['time'] }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+      <p>No attendance records found{% if not show_all %} for today{% endif %}.</p>
+      {% if not show_all %}
+        <a href="/?all=1" class="btn-secondary">View All Records</a>
+      {% endif %}
+    </div>
+    {% endif %}
+
+  </main>
+</body>
+</html>
