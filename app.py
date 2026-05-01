@@ -134,9 +134,10 @@ def load_known_faces():
         known_encodings.append(encodings[0])
         known_ids.append(student_id)
         known_names.append(full_name)
-        print(f"[INFO] Loaded face: {student_id} — {full_name}")
+        print(f"[INFO]   Loaded: {student_id} — {full_name}")
 
-    print(f"[INFO] Total known faces loaded: {len(known_encodings)}")
+    total = len(known_encodings)
+    print(f"[INFO] Total known faces loaded: {total}")
     return known_encodings, known_ids, known_names
 
 
@@ -204,51 +205,89 @@ def upload():
     Perform face recognition and log attendance.
     Returns a plain-text response string.
     """
-    jpeg_bytes = request.data
+    SEP = "════════════════════════════════════════"
+    print(SEP)
+
+    jpeg_bytes  = request.data
+    sender_ip   = request.remote_addr or "unknown"
+
     if not jpeg_bytes:
+        print(f"[CAPTURE] No image data received from {sender_ip}")
+        print(SEP)
         return "No image data received", 400
 
+    size_kb = len(jpeg_bytes) / 1024
+    print(f"[CAPTURE] New image received from {sender_ip}")
+    print(f"[STEP 1] Image size: {size_kb:.1f} KB")
+
+    # ── Decode image ──────────────────────────────────────────────────────────
     try:
-        # Convert JPEG bytes → numpy array for face_recognition
-        pil_image  = Image.open(BytesIO(jpeg_bytes)).convert('RGB')
-        img_array  = np.array(pil_image)
+        pil_image = Image.open(BytesIO(jpeg_bytes)).convert('RGB')
+        img_array = np.array(pil_image)
+        width, height = pil_image.size
+        print(f"[STEP 2] Image decoded successfully: {width}x{height} px")
     except Exception as e:
+        print(f"[ERROR] Image decode failed: {e}")
         app.logger.error("Image decode error: %s", e)
+        print(SEP)
         return "Invalid image data", 400
 
-    # Locate and encode faces in the received frame
+    # ── Detect & encode faces ─────────────────────────────────────────────────
+    print("[STEP 3] Detecting faces in image...")
     try:
         face_locations = face_recognition.face_locations(img_array)
         face_encs      = face_recognition.face_encodings(img_array, face_locations)
     except Exception as e:
+        print(f"[ERROR] Face recognition error: {e}")
         app.logger.error("Face recognition error: %s", e)
+        print(SEP)
         return "Face recognition failed", 500
 
-    if not face_encs:
-        return "Face not recognized"
+    num_faces = len(face_encs)
+    if num_faces == 0:
+        print(f"[STEP 4] ⚠ No face detected in image")
+        print(SEP)
+        return "No face detected"
+
+    print(f"[STEP 4] Faces detected: {num_faces}")
 
     today = date.today().strftime('%Y-%m-%d')
     now   = datetime.now().strftime('%H:%M:%S')
 
-    # Check each detected face against known encodings
-    for face_enc in face_encs:
+    # ── Match each face against known encodings ───────────────────────────────
+    num_known = len(known_encodings)
+    for face_idx, face_enc in enumerate(face_encs, start=1):
+        print(f"[STEP 5] Matching face {face_idx} against {num_known} known faces...")
+
         if not known_encodings:
+            print(f"[WARN]  No known faces to match against")
             break
 
-        matches   = face_recognition.compare_faces(known_encodings, face_enc, tolerance=TOLERANCE)
         distances = face_recognition.face_distance(known_encodings, face_enc)
         best_idx  = int(np.argmin(distances))
+        best_dist = float(distances[best_idx])
+        matches   = face_recognition.compare_faces(known_encodings, face_enc, tolerance=TOLERANCE)
+
+        print(f"[STEP 6] Best match: {known_ids[best_idx]} — {known_names[best_idx]} "
+              f"(distance: {best_dist:.2f})")
 
         if matches[best_idx]:
             student_id = known_ids[best_idx]
             full_name  = known_names[best_idx]
 
             if already_recorded_today(student_id, today):
+                print(f"[STEP 7] ⚠ Already recorded today: {full_name}")
+                print(SEP)
                 return f"Already recorded today: {full_name}"
 
             log_attendance(student_id, full_name, today, now)
+            print(f"[STEP 7] ✓ Attendance RECORDED: {full_name} at {now}")
+            print(SEP)
             return f"Attendance recorded: {full_name}"
+        else:
+            print(f"[WARN]  Face not recognized (closest distance: {best_dist:.2f})")
 
+    print(SEP)
     return "Face not recognized"
 
 
@@ -258,5 +297,6 @@ def upload():
 
 if __name__ == '__main__':
     init_db()
-    print("[INFO] Starting Flask attendance server on 0.0.0.0:5000")
+    print(f"[INFO] Database path: {DB_PATH}")
+    print(f"[INFO] Starting Flask attendance server on http://0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
