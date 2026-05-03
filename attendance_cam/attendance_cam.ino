@@ -104,12 +104,12 @@ const char index_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <h2>📷 Attendance Cam</h2>
+  <h2>Attendance Cam</h2>
   <p class="subtitle">Freenove ESP32-S3-WROOM</p>
 
   <img src="/stream" id="video">
 
-  <p id="status">✅ Ready</p>
+  <p id="status">Ready</p>
 
   <button class="btn" id="captureBtn" onclick="capture()">CAPTURE</button>
 
@@ -119,7 +119,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     function addLog(msg) {
       var log = document.getElementById("log");
       var line = document.createElement("div");
-      line.textContent = new Date().toLocaleTimeString() + " → " + msg;
+      line.textContent = new Date().toLocaleTimeString() + " -> " + msg;
       log.appendChild(line);
       log.scrollTop = log.scrollHeight;
     }
@@ -128,7 +128,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       var statusEl = document.getElementById("status");
       var btn = document.getElementById("captureBtn");
 
-      statusEl.innerHTML = "⏳ Capturing...";
+      statusEl.innerHTML = "Capturing...";
       statusEl.style.color = "yellow";
       btn.disabled = true;
 
@@ -141,16 +141,16 @@ const char index_html[] PROGMEM = R"rawliteral(
           btn.disabled = false;
           if (this.status == 200) {
             var resp = this.responseText.trim();
-            statusEl.innerHTML = "✅ " + resp;
+            statusEl.innerHTML = resp;
             statusEl.style.color = "#00ff00";
             addLog("Server: " + resp);
           } else {
-            statusEl.innerHTML = "❌ Error: " + this.responseText;
+            statusEl.innerHTML = "Error: " + this.responseText;
             statusEl.style.color = "red";
             addLog("Error: " + this.responseText);
           }
           setTimeout(function() {
-            statusEl.innerHTML = "✅ Ready";
+            statusEl.innerHTML = "Ready";
             statusEl.style.color = "#00ff00";
           }, 3000);
         }
@@ -158,14 +158,14 @@ const char index_html[] PROGMEM = R"rawliteral(
 
       xhttp.timeout = 30000;
       xhttp.ontimeout = function() {
-        statusEl.innerHTML = "⏱ Timeout — Pi took too long";
+        statusEl.innerHTML = "Timeout - Pi took too long";
         statusEl.style.color = "red";
         btn.disabled = false;
         addLog("Timeout after 30 seconds");
       };
 
       xhttp.onerror = function() {
-        statusEl.innerHTML = "❌ Connection Error";
+        statusEl.innerHTML = "Connection Error";
         statusEl.style.color = "red";
         btn.disabled = false;
         addLog("Connection error");
@@ -304,13 +304,13 @@ void setup() {
 
   // Use PSRAM for maximum quality (Freenove ESP32-S3-WROOM has 8MB PSRAM)
   if (psramFound()) {
-    Serial.println("[ESP32] PSRAM found — using maximum quality");
-    config.frame_size   = FRAMESIZE_UXGA;   // 1600x1200
-    config.jpeg_quality = 4;                // near lossless
+    Serial.println("[ESP32] PSRAM found - using maximum quality");
+    config.frame_size   = FRAMESIZE_UXGA;
+    config.jpeg_quality = 4;
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
   } else {
-    Serial.println("[ESP32] No PSRAM — falling back to QVGA");
+    Serial.println("[ESP32] No PSRAM - falling back to QVGA");
     config.frame_size   = FRAMESIZE_QVGA;
     config.jpeg_quality = 10;
     config.fb_count     = 1;
@@ -341,7 +341,7 @@ void setup() {
   // --- WiFi Access Point ---
   WiFi.softAP("ESP32-Camera", "12345678", 6);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  Serial.print("[ESP32] WiFi AP started — IP: ");
+  Serial.print("[ESP32] WiFi AP started - IP: ");
   Serial.println(WiFi.softAPIP());
 
   // --- Start Web Server ---
