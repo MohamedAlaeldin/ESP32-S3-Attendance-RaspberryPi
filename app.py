@@ -26,6 +26,7 @@ import os
 import json
 import csv
 import signal
+import socket
 import sqlite3
 import smtplib
 import subprocess
@@ -82,10 +83,161 @@ scan_records = {}
 known_encodings, known_ids, known_names = [], [], []
 
 # ──────────────────────────────────────────────
-# WiFi switch helper
+# WiFi switch helpers
 # ──────────────────────────────────────────────
+def run_cmd(cmd, timeout=20):
+    """Run a shell command and return (ok, stdout, stderr)."""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+    except Exception as e:
+        return False, '', str(e)
+
+
+def detect_wifi_interface():
+    """Try to detect the active WiFi interface name."""
+    candidates = ['wlan0', 'wlp2s0', 'wlp1s0']
+    for iface in candidates:
+        ok, out, _ = run_cmd(['ip', 'link', 'show', iface], timeout=8)
+        if ok and out:
+            return iface
+
+    ok, out, _ = run_cmd(['iw', 'dev'], timeout=8)
+    if ok:
+        lines = [line.strip() for line in out.splitlines()]
+        for line in lines:
+            if line.startswith('Interface '):
+                return line.split('Interface ', 1)[1].strip()
+
+    return 'wlan0'
+
+
+WIFI_IFACE = detect_wifi_interface()
+
+
+def disconnect_current_wifi():
+    """Disconnect from current WiFi/AP before scanning for home WiFi."""
+    print(f"[WIFI] Disconnecting current WiFi on interface '{WIFI_IFACE}'...")
+
+    commands = [
+        ['sudo', 'nmcli', 'device', 'disconnect', WIFI_IFACE],
+        ['sudo', 'nmcli', 'connection', 'down', 'Hotspot'],
+        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'disconnect'],
+        ['sudo', 'ip', 'link', 'set', WIFI_IFACE, 'down'],
+        ['sudo', 'ip', 'link', 'set', WIFI_IFACE, 'up'],
+    ]
+
+    for cmd in commands:
+        ok, out, err = run_cmd(cmd, timeout=12)
+        msg = out or err or 'done'
+        print(f"[WIFI] {'✓' if ok else '•'} {' '.join(cmd)} -> {msg}")
+        time.sleep(1)
+
+    time.sleep(3)
+
+
+def verify_internet(host='8.8.8.8', port=53, timeout=5):
+    """Check raw connectivity and DNS resolution before sending email."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            print(f"[NET] ✓ Internet reachable via {host}:{port}")
+            return True
+    except Exception as e:
+        print(f"[NET] Raw connectivity failed: {e}")
+
+    try:
+        socket.gethostbyname('smtp.gmail.com')
+        print("[NET] ✓ DNS resolution works")
+        return True
+    except Exception as e:
+        print(f"[NET] DNS resolution failed: {e}")
+
+    ok, out, err = run_cmd(['ping', '-c', '1', '-W', '3', '8.8.8.8'], timeout=6)
+    if ok:
+        print("[NET] ✓ Ping check passed")
+        return True
+
+    print(f"[NET] Ping check failed: {err or out or 'no response'}")
+    return False
+
+
+def connect_using_nmcli(ssid, pwd):
+    """Connect using direct nmcli connect command."""
+    cmd = ['sudo', 'nmcli', 'dev', 'wifi', 'connect', ssid]
+    if pwd:
+        cmd += ['password', pwd]
+    return run_cmd(cmd, timeout=30)
+
+
+def connect_using_saved_profile(ssid):
+    """Connect using a pre-saved NetworkManager profile if it exists."""
+    return run_cmd(['sudo', 'nmcli', 'connection', 'up', ssid], timeout=25)
+
+
+def connect_using_wpa_cli(ssid, pwd):
+    """Fallback connection using wpa_cli."""
+    print(f"[WIFI] Trying wpa_cli fallback on '{WIFI_IFACE}'...")
+
+    steps = [
+        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'reconfigure'],
+        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'add_network'],
+    ]
+
+    run_cmd(steps[0], timeout=10)
+    ok, net_id_out, err = run_cmd(steps[1], timeout=10)
+    if not ok:
+        return False, '', err or 'Failed to add network'
+
+    net_id = net_id_out.splitlines()[-1].strip()
+    if not net_id.isdigit():
+        return False, '', f'Unexpected network id: {net_id_out}'
+
+    cmds = [
+        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'set_network', net_id, 'ssid', f'"{ssid}"'],
+        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'set_network', net_id, 'psk', f'"{pwd}"'] if pwd else None,
+        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'enable_network', net_id],
+        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'select_network', net_id],
+        ['sudo', 'dhclient', WIFI_IFACE],
+    ]
+
+    for cmd in cmds:
+        if not cmd:
+            continue
+        ok, out, err = run_cmd(cmd, timeout=20)
+        if not ok:
+            return False, out, err
+        time.sleep(2)
+
+    return True, 'wpa_cli connection attempted', ''
+
+
+def connect_using_iwconfig(ssid, pwd):
+    """Last-resort fallback using iwconfig + dhclient."""
+    print(f"[WIFI] Trying iwconfig fallback on '{WIFI_IFACE}'...")
+
+    cmds = [
+        ['sudo', 'ip', 'link', 'set', WIFI_IFACE, 'up'],
+        ['sudo', 'iwconfig', WIFI_IFACE, 'essid', ssid],
+        ['sudo', 'dhclient', WIFI_IFACE],
+    ]
+
+    for cmd in cmds:
+        ok, out, err = run_cmd(cmd, timeout=20)
+        if not ok:
+            return False, out, err
+        time.sleep(2)
+
+    return True, 'iwconfig connection attempted', ''
+
+
 def switch_to_home_wifi(retries=3):
-    """Rescan, then reconnect Pi to home WiFi. Retries up to 3 times."""
+    """Disconnect from ESP32 hotspot first, then reconnect Pi to home WiFi.
+    Uses multiple fallback methods and verifies internet access before success."""
     ssid = course_session.get('wifi_ssid', '').strip()
     pwd  = course_session.get('wifi_pass', '').strip()
 
@@ -93,35 +245,66 @@ def switch_to_home_wifi(retries=3):
         print("[WIFI] No home WiFi SSID provided — skipping switch.")
         return False
 
-    print(f"[WIFI] Scanning for networks...")
-    try:
-        subprocess.run(['sudo', 'nmcli', 'dev', 'wifi', 'rescan'],
-                       capture_output=True, timeout=10)
-        time.sleep(5)   # wait for scan to complete
-    except Exception as e:
-        print(f"[WIFI] Rescan warning: {e}")
+    disconnect_current_wifi()
+
+    print(f"[WIFI] Scanning for networks on '{WIFI_IFACE}'...")
+    ok, out, err = run_cmd(['sudo', 'nmcli', 'dev', 'wifi', 'rescan'], timeout=15)
+    print(f"[WIFI] Rescan: {out or err or 'done'}")
+    time.sleep(5)
+
+    ok, out, err = run_cmd(['sudo', 'nmcli', '-f', 'SSID,SIGNAL', 'dev', 'wifi', 'list'], timeout=15)
+    if out:
+        print("[WIFI] Visible networks:")
+        for line in out.splitlines():
+            print(f"[WIFI]   {line}")
+    elif err:
+        print(f"[WIFI] Could not list visible networks: {err}")
 
     print(f"[WIFI] Switching to home WiFi: '{ssid}' ...")
     for attempt in range(1, retries + 1):
-        try:
-            cmd = ['sudo', 'nmcli', 'dev', 'wifi', 'connect', ssid]
-            if pwd:
-                cmd += ['password', pwd]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-            if result.returncode == 0:
-                print(f"[WIFI] ✓ Connected to '{ssid}'")
-                time.sleep(4)   # give DHCP a moment
+        print(f"[WIFI] Attempt {attempt}/{retries} using nmcli direct connect...")
+        ok, out, err = connect_using_nmcli(ssid, pwd)
+        if ok:
+            time.sleep(5)
+            if verify_internet():
+                print(f"[WIFI] ✓ Connected to '{ssid}' via nmcli direct connect")
                 return True
-            else:
-                err = result.stderr.strip() or result.stdout.strip()
-                print(f"[WIFI] Attempt {attempt}/{retries} failed: {err}")
-                if attempt < retries:
-                    print(f"[WIFI] Retrying in 5s...")
-                    time.sleep(5)
-        except Exception as e:
-            print(f"[WIFI] Attempt {attempt}/{retries} error: {e}")
-            if attempt < retries:
-                time.sleep(5)
+            print("[WIFI] Connected but internet not ready yet.")
+        print(f"[WIFI] nmcli direct failed: {err or out or 'unknown error'}")
+
+        print(f"[WIFI] Attempt {attempt}/{retries} using saved profile...")
+        ok, out, err = connect_using_saved_profile(ssid)
+        if ok:
+            time.sleep(5)
+            if verify_internet():
+                print(f"[WIFI] ✓ Connected to '{ssid}' via saved profile")
+                return True
+            print("[WIFI] Saved profile connected but internet not ready yet.")
+        print(f"[WIFI] Saved profile failed: {err or out or 'unknown error'}")
+
+        print(f"[WIFI] Attempt {attempt}/{retries} using wpa_cli fallback...")
+        ok, out, err = connect_using_wpa_cli(ssid, pwd)
+        if ok:
+            time.sleep(6)
+            if verify_internet():
+                print(f"[WIFI] ✓ Connected to '{ssid}' via wpa_cli")
+                return True
+            print("[WIFI] wpa_cli connected but internet not ready yet.")
+        print(f"[WIFI] wpa_cli failed: {err or out or 'unknown error'}")
+
+        print(f"[WIFI] Attempt {attempt}/{retries} using iwconfig fallback...")
+        ok, out, err = connect_using_iwconfig(ssid, pwd)
+        if ok:
+            time.sleep(6)
+            if verify_internet():
+                print(f"[WIFI] ✓ Connected to '{ssid}' via iwconfig")
+                return True
+            print("[WIFI] iwconfig connected but internet not ready yet.")
+        print(f"[WIFI] iwconfig failed: {err or out or 'unknown error'}")
+
+        if attempt < retries:
+            print("[WIFI] Retrying in 5s...")
+            time.sleep(5)
 
     print(f"[WIFI] ✗ Could not connect to '{ssid}' after {retries} attempts.")
     return False
@@ -175,26 +358,31 @@ def schedule_session_end():
 
             # 2. Switch Pi back to home WiFi
             wifi_ok = switch_to_home_wifi()
+            if not wifi_ok:
+                print("[EMAIL] Skipping report send because WiFi/internet is unavailable")
+            else:
+                print("[EMAIL] WiFi restored successfully. Internet looks ready.")
 
             # 3. Send email report
-            print("[EMAIL] Preparing attendance report...")
-            try:
-                today = date.today().strftime('%Y-%m-%d')
-                with get_db() as conn:
-                    records = conn.execute(
-                        "SELECT * FROM attendance "
-                        "WHERE date=? AND course_name=? AND section=?",
-                        (today, course_session['course_name'],
-                         course_session['section'])
-                    ).fetchall()
-                csv_content = generate_csv(records)
-                ok = send_email_report(course_session['email'], csv_content)
-                if ok:
-                    print(f"[EMAIL] ✓ Report sent to {course_session['email']}")
-                else:
-                    print("[EMAIL] ✗ Failed to send — check SMTP credentials")
-            except Exception as e:
-                print(f"[EMAIL] ✗ Error: {e}")
+            if wifi_ok:
+                print("[EMAIL] Preparing attendance report...")
+                try:
+                    today = date.today().strftime('%Y-%m-%d')
+                    with get_db() as conn:
+                        records = conn.execute(
+                            "SELECT * FROM attendance "
+                            "WHERE date=? AND course_name=? AND section=?",
+                            (today, course_session['course_name'],
+                             course_session['section'])
+                        ).fetchall()
+                    csv_content = generate_csv(records)
+                    ok = send_email_report(course_session['email'], csv_content)
+                    if ok:
+                        print(f"[EMAIL] ✓ Report sent to {course_session['email']}")
+                    else:
+                        print("[EMAIL] ✗ Failed to send — check SMTP credentials / network")
+                except Exception as e:
+                    print(f"[EMAIL] ✗ Error: {e}")
 
             print("[SESSION] Shutting down server...")
             print("═" * 40)
@@ -469,7 +657,7 @@ def send_email_report(to_email, csv_content):
         att.add_header('Content-Disposition', f'attachment; filename="{fname}"')
         msg.attach(att)
 
-        with smtplib.SMTP(smtp_host, smtp_port) as srv:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as srv:
             srv.starttls()
             srv.login(smtp_user, smtp_pass)
             srv.sendmail(smtp_user, to_email, msg.as_string())
@@ -714,6 +902,7 @@ if __name__ == '__main__':
     # 4. Schedule auto session-end + auto email
     schedule_session_end()
 
-    print(f"[INFO] DB       : {DB_PATH}")
+    print(f"[INFO] WiFi IF   : {WIFI_IFACE}")
+    print(f"[INFO] DB        : {DB_PATH}")
     print(f"[INFO] Starting Flask on http://0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
