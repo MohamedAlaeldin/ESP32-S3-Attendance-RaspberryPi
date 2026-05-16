@@ -84,8 +84,8 @@ known_encodings, known_ids, known_names = [], [], []
 # ──────────────────────────────────────────────
 # WiFi switch helper
 # ──────────────────────────────────────────────
-def switch_to_home_wifi():
-    """Reconnect Pi to home WiFi using credentials from popup."""
+def switch_to_home_wifi(retries=3):
+    """Rescan, then reconnect Pi to home WiFi. Retries up to 3 times."""
     ssid = course_session.get('wifi_ssid', '').strip()
     pwd  = course_session.get('wifi_pass', '').strip()
 
@@ -93,22 +93,38 @@ def switch_to_home_wifi():
         print("[WIFI] No home WiFi SSID provided — skipping switch.")
         return False
 
-    print(f"[WIFI] Switching to home WiFi: '{ssid}' ...")
+    print(f"[WIFI] Scanning for networks...")
     try:
-        cmd = ['sudo', 'nmcli', 'dev', 'wifi', 'connect', ssid]
-        if pwd:
-            cmd += ['password', pwd]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        if result.returncode == 0:
-            print(f"[WIFI] ✓ Connected to '{ssid}'")
-            time.sleep(3)   # give DHCP a moment
-            return True
-        else:
-            print(f"[WIFI] ✗ Failed: {result.stderr.strip()}")
-            return False
+        subprocess.run(['sudo', 'nmcli', 'dev', 'wifi', 'rescan'],
+                       capture_output=True, timeout=10)
+        time.sleep(5)   # wait for scan to complete
     except Exception as e:
-        print(f"[WIFI] ✗ Error: {e}")
-        return False
+        print(f"[WIFI] Rescan warning: {e}")
+
+    print(f"[WIFI] Switching to home WiFi: '{ssid}' ...")
+    for attempt in range(1, retries + 1):
+        try:
+            cmd = ['sudo', 'nmcli', 'dev', 'wifi', 'connect', ssid]
+            if pwd:
+                cmd += ['password', pwd]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+            if result.returncode == 0:
+                print(f"[WIFI] ✓ Connected to '{ssid}'")
+                time.sleep(4)   # give DHCP a moment
+                return True
+            else:
+                err = result.stderr.strip() or result.stdout.strip()
+                print(f"[WIFI] Attempt {attempt}/{retries} failed: {err}")
+                if attempt < retries:
+                    print(f"[WIFI] Retrying in 5s...")
+                    time.sleep(5)
+        except Exception as e:
+            print(f"[WIFI] Attempt {attempt}/{retries} error: {e}")
+            if attempt < retries:
+                time.sleep(5)
+
+    print(f"[WIFI] ✗ Could not connect to '{ssid}' after {retries} attempts.")
+    return False
 
 # ──────────────────────────────────────────────
 # Auto-exit students who only scanned entry
@@ -116,7 +132,6 @@ def switch_to_home_wifi():
 def auto_exit_missing():
     """Set exit_time = class end_time for students who only scanned entry."""
     end_time_str = course_session['end_time'] + ':00'   # "HH:MM:SS"
-    today = date.today().strftime('%Y-%m-%d')
 
     for sid, rec in scan_records.items():
         if rec['exit'] is None:
@@ -159,7 +174,7 @@ def schedule_session_end():
             auto_exit_missing()
 
             # 2. Switch Pi back to home WiFi
-            switch_to_home_wifi()
+            wifi_ok = switch_to_home_wifi()
 
             # 3. Send email report
             print("[EMAIL] Preparing attendance report...")
@@ -225,7 +240,6 @@ def show_course_popup():
     frame = tk.Frame(root, bg='#1a1a2e')
     frame.pack(padx=35, fill='x')
 
-    # Section divider helper
     def divider(row, text):
         tk.Label(frame, text=text, bg='#1a1a2e', fg='#00d4ff',
                  font=('Helvetica', 10, 'bold')).grid(
@@ -248,7 +262,6 @@ def show_course_popup():
 
     course_e, start_e, end_e, section_e, email_e = entries
 
-    # WiFi section divider
     wifi_row = len(course_fields)
     divider(wifi_row, "── Home WiFi (for email after session) ──")
 
