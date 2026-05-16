@@ -10,6 +10,8 @@ Features:
   - 80% attendance rule
   - CSV export + email report
   - Dashboard with color-coded status
+  - Auto session-end at end_time → logs + graceful shutdown
+  - Unknown face → clear message sent back to ESP32 HTML + Pi logs
 
 Routes:
   GET/POST /login        — admin login
@@ -23,10 +25,11 @@ Routes:
 import os
 import json
 import csv
+import signal
 import sqlite3
 import smtplib
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO, StringIO
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -72,6 +75,44 @@ course_session = {
 
 # Per-student scan tracking: {student_id: {'entry': 'HH:MM:SS', 'exit': None}}
 scan_records = {}
+
+# ──────────────────────────────────────────────
+# Session end timer
+# ──────────────────────────────────────────────
+def schedule_session_end():
+    """Fires a background thread that sleeps until end_time, then shuts down."""
+    try:
+        end_dt = datetime.strptime(course_session['end_time'], '%H:%M').replace(
+            year=datetime.now().year,
+            month=datetime.now().month,
+            day=datetime.now().day
+        )
+        now_dt = datetime.now().replace(second=0, microsecond=0)
+
+        # If end_time already passed today, don't schedule
+        if end_dt <= now_dt:
+            print("[SESSION] End time is in the past — auto-shutdown not scheduled.")
+            return
+
+        delay = (end_dt - datetime.now()).total_seconds()
+        print(f"[SESSION] Auto-shutdown scheduled in {delay/60:.1f} min at {course_session['end_time']}")
+
+        def _shutdown():
+            end_str = datetime.now().strftime('%H:%M:%S')
+            print("\n" + "═" * 40)
+            print(f"[SESSION] ⏰ Session ended at {end_str}")
+            print(f"[SESSION] Course  : {course_session['course_name']}")
+            print(f"[SESSION] Section : {course_session['section']}")
+            print(f"[SESSION] Shutting down server...")
+            print("═" * 40)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        t = threading.Timer(delay, _shutdown)
+        t.daemon = True
+        t.start()
+
+    except Exception as e:
+        print(f"[WARN] Could not schedule session end: {e}")
 
 # ──────────────────────────────────────────────
 # Tkinter popup
@@ -287,7 +328,7 @@ def send_email_report(to_email, csv_content):
         print("[EMAIL] SMTP_USER / SMTP_PASS not set in environment — skipping email")
         return False
 
-    course = course_session['course_name']
+    course  = course_session['course_name']
     section = course_session['section']
     today   = date.today().strftime('%Y-%m-%d')
     fname   = f"attendance_{course}_{section}_{today}.csv"
@@ -439,7 +480,7 @@ def send_report():
 
 @app.route('/upload', methods=['POST'])
 def upload():
-    SEP = "\u2550" * 40
+    SEP = "═" * 40
     print(SEP)
 
     jpeg_bytes = request.data
@@ -477,7 +518,7 @@ def upload():
         return "Face recognition failed", 500
 
     if not face_encs:
-        print("[STEP 4] \u26a0 No face detected")
+        print("[STEP 4] ⚠ No face detected")
         print(SEP)
         return "No face detected"
 
@@ -497,13 +538,15 @@ def upload():
         matches   = face_recognition.compare_faces(
             known_encodings, face_enc, tolerance=TOLERANCE)
 
-        print(f"[STEP 6] Best: {known_ids[best_idx]} — {known_names[best_idx]} "
+        print(f"[STEP 6] Best match: {known_ids[best_idx]} — {known_names[best_idx]} "
               f"(distance: {best_dist:.2f})")
 
         if not matches[best_idx]:
-            print(f"[WARN] Not recognized (distance: {best_dist:.2f})")
+            # ── Unknown face ────────────────────────────────────────
+            msg = "⚠ Unknown Face: This student is not registered in this course"
+            print(f"[WARN] {msg} (distance: {best_dist:.2f})")
             print(SEP)
-            return "Face not recognized"
+            return msg, 200
 
         sid  = known_ids[best_idx]
         name = known_names[best_idx]
@@ -513,18 +556,18 @@ def upload():
             scan_records[sid] = {'entry': now, 'exit': None}
             get_or_create_record(sid, name)
             update_entry_time(sid, now)
-            print(f"[STEP 7] \u2713 ENTRY: {name} at {now}")
+            print(f"[STEP 7] ✓ ENTRY: {name} at {now}")
             print(SEP)
-            return f"Entry recorded: {name} at {now}"
+            return f"✓ Entry recorded: {name} at {now}"
 
         # ── Second scan = exit ──────────────────────────────────────
         if scan_records[sid]['exit'] is None:
             scan_records[sid]['exit'] = now
             status = calculate_status(scan_records[sid]['entry'], now)
             update_exit_and_status(sid, now, status)
-            print(f"[STEP 7] \u2713 EXIT: {name} at {now} \u2192 {status}")
+            print(f"[STEP 7] ✓ EXIT: {name} at {now} → {status}")
             print(SEP)
-            return f"Exit recorded: {name} \u2014 {status}"
+            return f"✓ Exit recorded: {name} — {status}"
 
         # ── Already complete ────────────────────────────────────────
         print(f"[INFO] {name} already fully recorded")
@@ -532,7 +575,7 @@ def upload():
         return f"Already recorded today: {name}"
 
     print(SEP)
-    return "Face not recognized"
+    return "⚠ Unknown Face: This student is not registered in this course", 200
 
 # ──────────────────────────────────────────────
 # Entry point
@@ -550,6 +593,9 @@ if __name__ == '__main__':
 
     # 3. Load known faces
     known_encodings, known_ids, known_names = load_known_faces()
+
+    # 4. Schedule auto session-end
+    schedule_session_end()
 
     print(f"[INFO] DB       : {DB_PATH}")
     print(f"[INFO] Starting Flask on http://0.0.0.0:5000")
