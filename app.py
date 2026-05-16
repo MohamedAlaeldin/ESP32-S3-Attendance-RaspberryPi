@@ -5,12 +5,12 @@ Runs on Raspberry Pi 5 / Raspbian OS
 
 Features:
   - Tkinter popup at startup to configure course session
+  - WiFi SSID + Password entered in popup → Pi switches to home WiFi at session end
   - First scan  = entry time
-  - Second scan = exit time
+  - Second scan = exit time (optional — if missing, auto-set to class end_time)
   - 80% attendance rule
-  - CSV export + email report
+  - CSV export + email report (auto-sent at session end)
   - Dashboard with color-coded status
-  - Auto session-end at end_time → sends CSV email → graceful shutdown
   - Unknown face → clear message sent back to ESP32 HTML + Pi logs
 
 Routes:
@@ -28,8 +28,10 @@ import csv
 import signal
 import sqlite3
 import smtplib
+import subprocess
 import threading
-from datetime import date, datetime, timedelta
+import time
+from datetime import date, datetime
 from io import BytesIO, StringIO
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -37,7 +39,6 @@ from email.mime.base import MIMEBase
 from email import encoders
 
 import tkinter as tk
-from tkinter import messagebox
 
 import face_recognition
 import numpy as np
@@ -71,17 +72,66 @@ course_session = {
     'section':     '',
     'email':       '',
     'date':        '',
+    'wifi_ssid':   '',
+    'wifi_pass':   '',
 }
 
 # Per-student scan tracking: {student_id: {'entry': 'HH:MM:SS', 'exit': None}}
 scan_records = {}
 
+known_encodings, known_ids, known_names = [], [], []
+
+# ──────────────────────────────────────────────
+# WiFi switch helper
+# ──────────────────────────────────────────────
+def switch_to_home_wifi():
+    """Reconnect Pi to home WiFi using credentials from popup."""
+    ssid = course_session.get('wifi_ssid', '').strip()
+    pwd  = course_session.get('wifi_pass', '').strip()
+
+    if not ssid:
+        print("[WIFI] No home WiFi SSID provided — skipping switch.")
+        return False
+
+    print(f"[WIFI] Switching to home WiFi: '{ssid}' ...")
+    try:
+        cmd = ['sudo', 'nmcli', 'dev', 'wifi', 'connect', ssid]
+        if pwd:
+            cmd += ['password', pwd]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if result.returncode == 0:
+            print(f"[WIFI] ✓ Connected to '{ssid}'")
+            time.sleep(3)   # give DHCP a moment
+            return True
+        else:
+            print(f"[WIFI] ✗ Failed: {result.stderr.strip()}")
+            return False
+    except Exception as e:
+        print(f"[WIFI] ✗ Error: {e}")
+        return False
+
+# ──────────────────────────────────────────────
+# Auto-exit students who only scanned entry
+# ──────────────────────────────────────────────
+def auto_exit_missing():
+    """Set exit_time = class end_time for students who only scanned entry."""
+    end_time_str = course_session['end_time'] + ':00'   # "HH:MM:SS"
+    today = date.today().strftime('%Y-%m-%d')
+
+    for sid, rec in scan_records.items():
+        if rec['exit'] is None:
+            name = known_names[known_ids.index(sid)] if sid in known_ids else sid
+            status = calculate_status(rec['entry'], end_time_str)
+            update_exit_and_status(sid, end_time_str, status)
+            scan_records[sid]['exit'] = end_time_str
+            print(f"[AUTO-EXIT] {name} → exit set to {end_time_str} → {status}")
+
 # ──────────────────────────────────────────────
 # Session end timer
 # ──────────────────────────────────────────────
 def schedule_session_end():
-    """Fires a background thread that sleeps until end_time,
-    sends the CSV email report, then shuts down Flask."""
+    """Background thread: waits until end_time, auto-exits students,
+    switches to home WiFi, sends CSV email, then shuts down."""
     try:
         end_dt = datetime.strptime(course_session['end_time'], '%H:%M').replace(
             year=datetime.now().year,
@@ -89,7 +139,6 @@ def schedule_session_end():
             day=datetime.now().day
         )
 
-        # If end_time already passed today, don't schedule
         if end_dt <= datetime.now():
             print("[SESSION] End time is in the past — auto-shutdown not scheduled.")
             return
@@ -105,7 +154,14 @@ def schedule_session_end():
             print(f"[SESSION] Course  : {course_session['course_name']}")
             print(f"[SESSION] Section : {course_session['section']}")
 
-            # ── Auto-send email report ──────────────────────────────
+            # 1. Auto-exit students who only scanned entry
+            print("[SESSION] Auto-closing open entries...")
+            auto_exit_missing()
+
+            # 2. Switch Pi back to home WiFi
+            switch_to_home_wifi()
+
+            # 3. Send email report
             print("[EMAIL] Preparing attendance report...")
             try:
                 today = date.today().strftime('%Y-%m-%d')
@@ -121,9 +177,9 @@ def schedule_session_end():
                 if ok:
                     print(f"[EMAIL] ✓ Report sent to {course_session['email']}")
                 else:
-                    print("[EMAIL] ✗ Failed to send report — check SMTP credentials")
+                    print("[EMAIL] ✗ Failed to send — check SMTP credentials")
             except Exception as e:
-                print(f"[EMAIL] ✗ Error generating/sending report: {e}")
+                print(f"[EMAIL] ✗ Error: {e}")
 
             print("[SESSION] Shutting down server...")
             print("═" * 40)
@@ -143,7 +199,7 @@ def show_course_popup():
     """Blocking tkinter window — fills course_session before Flask starts."""
     root = tk.Tk()
     root.title("Attendance System — Course Setup")
-    root.geometry("480x400")
+    root.geometry("500x530")
     root.resizable(False, False)
     root.configure(bg='#1a1a2e')
 
@@ -151,36 +207,64 @@ def show_course_popup():
         return tk.Label(parent, text=text, bg='#1a1a2e', fg='white',
                         font=('Helvetica', 11), **kw)
 
-    def entry_field(parent, default=''):
-        e = tk.Entry(parent, font=('Helvetica', 11), width=26,
-                     bg='#16213e', fg='white', insertbackground='white',
-                     relief='flat', bd=5)
+    def entry_field(parent, default='', show=None):
+        kw = dict(font=('Helvetica', 11), width=26,
+                  bg='#16213e', fg='white', insertbackground='white',
+                  relief='flat', bd=5)
+        if show:
+            kw['show'] = show
+        e = tk.Entry(parent, **kw)
         e.insert(0, default)
         return e
 
     tk.Label(root, text="ESP32-S3 Attendance System", bg='#1a1a2e',
              fg='#00d4ff', font=('Helvetica', 14, 'bold')).pack(pady=(15, 3))
     tk.Label(root, text="Enter Course Session Details", bg='#1a1a2e',
-             fg='#aaa', font=('Helvetica', 10)).pack(pady=(0, 12))
+             fg='#aaa', font=('Helvetica', 10)).pack(pady=(0, 8))
 
     frame = tk.Frame(root, bg='#1a1a2e')
     frame.pack(padx=35, fill='x')
 
-    fields = [
-        ("Course Name:",  "Mathematics"),
-        ("Start Time:",   "10:00 AM"),
-        ("End Time:",     "11:30 AM"),
-        ("Section:",      "2B"),
-        ("Send Email to:","example@outlook.com"),
+    # Section divider helper
+    def divider(row, text):
+        tk.Label(frame, text=text, bg='#1a1a2e', fg='#00d4ff',
+                 font=('Helvetica', 10, 'bold')).grid(
+            row=row, column=0, columnspan=2, sticky='w', pady=(10, 2))
+
+    course_fields = [
+        ("Course Name:",   "Mathematics", None),
+        ("Start Time:",    "10:00 AM",    None),
+        ("End Time:",      "11:30 AM",    None),
+        ("Section:",       "2B",          None),
+        ("Send Email to:", "example@gmail.com", None),
     ]
+
     entries = []
-    for row, (label, default) in enumerate(fields):
-        lbl(frame, label).grid(row=row, column=0, sticky='w', pady=7)
-        e = entry_field(frame, default)
-        e.grid(row=row, column=1, pady=7, padx=(12, 0))
+    for i, (label, default, show) in enumerate(course_fields):
+        lbl(frame, label).grid(row=i, column=0, sticky='w', pady=6)
+        e = entry_field(frame, default, show=show)
+        e.grid(row=i, column=1, pady=6, padx=(12, 0))
         entries.append(e)
 
     course_e, start_e, end_e, section_e, email_e = entries
+
+    # WiFi section divider
+    wifi_row = len(course_fields)
+    divider(wifi_row, "── Home WiFi (for email after session) ──")
+
+    wifi_fields = [
+        ("WiFi Name:",     "",  None),
+        ("WiFi Password:", "",  '*'),
+    ]
+    wifi_entries = []
+    for j, (label, default, show) in enumerate(wifi_fields):
+        r = wifi_row + 1 + j
+        lbl(frame, label).grid(row=r, column=0, sticky='w', pady=6)
+        e = entry_field(frame, default, show=show)
+        e.grid(row=r, column=1, pady=6, padx=(12, 0))
+        wifi_entries.append(e)
+
+    wifi_e, wpass_e = wifi_entries
 
     err_lbl = tk.Label(root, text='', bg='#1a1a2e', fg='red',
                        font=('Helvetica', 10))
@@ -201,9 +285,11 @@ def show_course_popup():
         end     = end_e.get().strip()
         section = section_e.get().strip()
         email   = email_e.get().strip()
+        wifi    = wifi_e.get().strip()
+        wpass   = wpass_e.get().strip()
 
         if not all([course, start, end, section, email]):
-            err_lbl.config(text='All fields are required!')
+            err_lbl.config(text='All course fields are required!')
             return
 
         s24 = parse_time(start)
@@ -219,18 +305,23 @@ def show_course_popup():
             'section':     section,
             'email':       email,
             'date':        date.today().strftime('%Y-%m-%d'),
+            'wifi_ssid':   wifi,
+            'wifi_pass':   wpass,
         })
 
         print(f"\n[SESSION] Course  : {course}")
         print(f"[SESSION] Section : {section}")
         print(f"[SESSION] Time    : {s24} - {e24}")
         print(f"[SESSION] Email   : {email}")
-        print(f"[SESSION] Date    : {course_session['date']}\n")
+        print(f"[SESSION] Date    : {course_session['date']}")
+        if wifi:
+            print(f"[SESSION] Home WiFi: {wifi}")
+        print()
         root.destroy()
 
     tk.Button(root, text="START SESSION", command=on_start,
               bg='#007bff', fg='white', font=('Helvetica', 13, 'bold'),
-              relief='flat', padx=20, pady=9, cursor='hand2').pack(pady=14)
+              relief='flat', padx=20, pady=9, cursor='hand2').pack(pady=12)
 
     root.mainloop()
 
@@ -258,11 +349,6 @@ def init_db():
             )
         """)
         conn.commit()
-
-def _where():
-    """WHERE clause values for current session."""
-    return (course_session['course_name'], course_session['section'],
-            date.today().strftime('%Y-%m-%d'))
 
 def get_or_create_record(student_id, full_name):
     today = date.today().strftime('%Y-%m-%d')
@@ -417,8 +503,6 @@ def load_known_faces():
     print(f"[INFO] Total known faces: {len(encs)}")
     return encs, ids, names
 
-known_encodings, known_ids, known_names = [], [], []
-
 # ──────────────────────────────────────────────
 # Routes
 # ──────────────────────────────────────────────
@@ -517,7 +601,6 @@ def upload():
     print(f"[CAPTURE] New image from {sender_ip}")
     print(f"[STEP 1] Image size: {size_kb:.1f} KB")
 
-    # Decode + rotate 180° (camera mounted upside-down)
     try:
         pil_image = Image.open(BytesIO(jpeg_bytes)).convert('RGB')
         pil_image = pil_image.rotate(180)
@@ -564,7 +647,6 @@ def upload():
               f"(distance: {best_dist:.2f})")
 
         if not matches[best_idx]:
-            # ── Unknown face ────────────────────────────────────────
             msg = "⚠ Unknown Face: This student is not registered in this course"
             print(f"[WARN] {msg} (distance: {best_dist:.2f})")
             print(SEP)
