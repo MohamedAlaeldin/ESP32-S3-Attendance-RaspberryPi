@@ -10,7 +10,7 @@ Features:
   - 80% attendance rule
   - CSV export + email report
   - Dashboard with color-coded status
-  - Auto session-end at end_time → logs + graceful shutdown
+  - Auto session-end at end_time → sends CSV email → graceful shutdown
   - Unknown face → clear message sent back to ESP32 HTML + Pi logs
 
 Routes:
@@ -80,22 +80,23 @@ scan_records = {}
 # Session end timer
 # ──────────────────────────────────────────────
 def schedule_session_end():
-    """Fires a background thread that sleeps until end_time, then shuts down."""
+    """Fires a background thread that sleeps until end_time,
+    sends the CSV email report, then shuts down Flask."""
     try:
         end_dt = datetime.strptime(course_session['end_time'], '%H:%M').replace(
             year=datetime.now().year,
             month=datetime.now().month,
             day=datetime.now().day
         )
-        now_dt = datetime.now().replace(second=0, microsecond=0)
 
         # If end_time already passed today, don't schedule
-        if end_dt <= now_dt:
+        if end_dt <= datetime.now():
             print("[SESSION] End time is in the past — auto-shutdown not scheduled.")
             return
 
         delay = (end_dt - datetime.now()).total_seconds()
-        print(f"[SESSION] Auto-shutdown scheduled in {delay/60:.1f} min at {course_session['end_time']}")
+        print(f"[SESSION] Auto-shutdown scheduled in {delay/60:.1f} min "
+              f"at {course_session['end_time']}")
 
         def _shutdown():
             end_str = datetime.now().strftime('%H:%M:%S')
@@ -103,7 +104,28 @@ def schedule_session_end():
             print(f"[SESSION] ⏰ Session ended at {end_str}")
             print(f"[SESSION] Course  : {course_session['course_name']}")
             print(f"[SESSION] Section : {course_session['section']}")
-            print(f"[SESSION] Shutting down server...")
+
+            # ── Auto-send email report ──────────────────────────────
+            print("[EMAIL] Preparing attendance report...")
+            try:
+                today = date.today().strftime('%Y-%m-%d')
+                with get_db() as conn:
+                    records = conn.execute(
+                        "SELECT * FROM attendance "
+                        "WHERE date=? AND course_name=? AND section=?",
+                        (today, course_session['course_name'],
+                         course_session['section'])
+                    ).fetchall()
+                csv_content = generate_csv(records)
+                ok = send_email_report(course_session['email'], csv_content)
+                if ok:
+                    print(f"[EMAIL] ✓ Report sent to {course_session['email']}")
+                else:
+                    print("[EMAIL] ✗ Failed to send report — check SMTP credentials")
+            except Exception as e:
+                print(f"[EMAIL] ✗ Error generating/sending report: {e}")
+
+            print("[SESSION] Shutting down server...")
             print("═" * 40)
             os.kill(os.getpid(), signal.SIGINT)
 
@@ -594,7 +616,7 @@ if __name__ == '__main__':
     # 3. Load known faces
     known_encodings, known_ids, known_names = load_known_faces()
 
-    # 4. Schedule auto session-end
+    # 4. Schedule auto session-end + auto email
     schedule_session_end()
 
     print(f"[INFO] DB       : {DB_PATH}")
