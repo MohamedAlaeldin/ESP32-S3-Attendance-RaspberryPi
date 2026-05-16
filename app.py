@@ -5,11 +5,10 @@ Runs on Raspberry Pi 5 / Raspbian OS
 
 Features:
   - Tkinter popup at startup to configure course session
-  - WiFi SSID + Password entered in popup → Pi switches to home WiFi at session end
   - First scan  = entry time
   - Second scan = exit time (optional — if missing, auto-set to class end_time)
   - 80% attendance rule
-  - CSV export + email report (auto-sent at session end)
+  - CSV export + email report
   - Dashboard with color-coded status
   - Unknown face → clear message sent back to ESP32 HTML + Pi logs
 
@@ -26,12 +25,9 @@ import os
 import json
 import csv
 import signal
-import socket
 import sqlite3
 import smtplib
-import subprocess
 import threading
-import time
 from datetime import date, datetime
 from io import BytesIO, StringIO
 from email.mime.multipart import MIMEMultipart
@@ -73,241 +69,12 @@ course_session = {
     'section':     '',
     'email':       '',
     'date':        '',
-    'wifi_ssid':   '',
-    'wifi_pass':   '',
 }
 
 # Per-student scan tracking: {student_id: {'entry': 'HH:MM:SS', 'exit': None}}
 scan_records = {}
 
 known_encodings, known_ids, known_names = [], [], []
-
-# ──────────────────────────────────────────────
-# WiFi switch helpers
-# ──────────────────────────────────────────────
-def run_cmd(cmd, timeout=20):
-    """Run a shell command and return (ok, stdout, stderr)."""
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
-    except Exception as e:
-        return False, '', str(e)
-
-
-def detect_wifi_interface():
-    """Try to detect the active WiFi interface name."""
-    candidates = ['wlan0', 'wlp2s0', 'wlp1s0']
-    for iface in candidates:
-        ok, out, _ = run_cmd(['ip', 'link', 'show', iface], timeout=8)
-        if ok and out:
-            return iface
-
-    ok, out, _ = run_cmd(['iw', 'dev'], timeout=8)
-    if ok:
-        lines = [line.strip() for line in out.splitlines()]
-        for line in lines:
-            if line.startswith('Interface '):
-                return line.split('Interface ', 1)[1].strip()
-
-    return 'wlan0'
-
-
-WIFI_IFACE = detect_wifi_interface()
-
-
-def disconnect_current_wifi():
-    """Disconnect from current WiFi/AP before scanning for home WiFi."""
-    print(f"[WIFI] Disconnecting current WiFi on interface '{WIFI_IFACE}'...")
-
-    commands = [
-        ['sudo', 'nmcli', 'device', 'disconnect', WIFI_IFACE],
-        ['sudo', 'nmcli', 'connection', 'down', 'Hotspot'],
-        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'disconnect'],
-        ['sudo', 'ip', 'link', 'set', WIFI_IFACE, 'down'],
-        ['sudo', 'ip', 'link', 'set', WIFI_IFACE, 'up'],
-    ]
-
-    for cmd in commands:
-        ok, out, err = run_cmd(cmd, timeout=12)
-        msg = out or err or 'done'
-        print(f"[WIFI] {'✓' if ok else '•'} {' '.join(cmd)} -> {msg}")
-        time.sleep(1)
-
-    time.sleep(3)
-
-
-def verify_internet(host='8.8.8.8', port=53, timeout=5):
-    """Check raw connectivity and DNS resolution before sending email."""
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            print(f"[NET] ✓ Internet reachable via {host}:{port}")
-            return True
-    except Exception as e:
-        print(f"[NET] Raw connectivity failed: {e}")
-
-    try:
-        socket.gethostbyname('smtp.gmail.com')
-        print("[NET] ✓ DNS resolution works")
-        return True
-    except Exception as e:
-        print(f"[NET] DNS resolution failed: {e}")
-
-    ok, out, err = run_cmd(['ping', '-c', '1', '-W', '3', '8.8.8.8'], timeout=6)
-    if ok:
-        print("[NET] ✓ Ping check passed")
-        return True
-
-    print(f"[NET] Ping check failed: {err or out or 'no response'}")
-    return False
-
-
-def connect_using_nmcli(ssid, pwd):
-    """Connect using direct nmcli connect command."""
-    cmd = ['sudo', 'nmcli', 'dev', 'wifi', 'connect', ssid]
-    if pwd:
-        cmd += ['password', pwd]
-    return run_cmd(cmd, timeout=30)
-
-
-def connect_using_saved_profile(ssid):
-    """Connect using a pre-saved NetworkManager profile if it exists."""
-    return run_cmd(['sudo', 'nmcli', 'connection', 'up', ssid], timeout=25)
-
-
-def connect_using_wpa_cli(ssid, pwd):
-    """Fallback connection using wpa_cli."""
-    print(f"[WIFI] Trying wpa_cli fallback on '{WIFI_IFACE}'...")
-
-    steps = [
-        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'reconfigure'],
-        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'add_network'],
-    ]
-
-    run_cmd(steps[0], timeout=10)
-    ok, net_id_out, err = run_cmd(steps[1], timeout=10)
-    if not ok:
-        return False, '', err or 'Failed to add network'
-
-    net_id = net_id_out.splitlines()[-1].strip()
-    if not net_id.isdigit():
-        return False, '', f'Unexpected network id: {net_id_out}'
-
-    cmds = [
-        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'set_network', net_id, 'ssid', f'"{ssid}"'],
-        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'set_network', net_id, 'psk', f'"{pwd}"'] if pwd else None,
-        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'enable_network', net_id],
-        ['sudo', 'wpa_cli', '-i', WIFI_IFACE, 'select_network', net_id],
-        ['sudo', 'dhclient', WIFI_IFACE],
-    ]
-
-    for cmd in cmds:
-        if not cmd:
-            continue
-        ok, out, err = run_cmd(cmd, timeout=20)
-        if not ok:
-            return False, out, err
-        time.sleep(2)
-
-    return True, 'wpa_cli connection attempted', ''
-
-
-def connect_using_iwconfig(ssid, pwd):
-    """Last-resort fallback using iwconfig + dhclient."""
-    print(f"[WIFI] Trying iwconfig fallback on '{WIFI_IFACE}'...")
-
-    cmds = [
-        ['sudo', 'ip', 'link', 'set', WIFI_IFACE, 'up'],
-        ['sudo', 'iwconfig', WIFI_IFACE, 'essid', ssid],
-        ['sudo', 'dhclient', WIFI_IFACE],
-    ]
-
-    for cmd in cmds:
-        ok, out, err = run_cmd(cmd, timeout=20)
-        if not ok:
-            return False, out, err
-        time.sleep(2)
-
-    return True, 'iwconfig connection attempted', ''
-
-
-def switch_to_home_wifi(retries=3):
-    """Disconnect from ESP32 hotspot first, then reconnect Pi to home WiFi.
-    Uses multiple fallback methods and verifies internet access before success."""
-    ssid = course_session.get('wifi_ssid', '').strip()
-    pwd  = course_session.get('wifi_pass', '').strip()
-
-    if not ssid:
-        print("[WIFI] No home WiFi SSID provided — skipping switch.")
-        return False
-
-    disconnect_current_wifi()
-
-    print(f"[WIFI] Scanning for networks on '{WIFI_IFACE}'...")
-    ok, out, err = run_cmd(['sudo', 'nmcli', 'dev', 'wifi', 'rescan'], timeout=15)
-    print(f"[WIFI] Rescan: {out or err or 'done'}")
-    time.sleep(5)
-
-    ok, out, err = run_cmd(['sudo', 'nmcli', '-f', 'SSID,SIGNAL', 'dev', 'wifi', 'list'], timeout=15)
-    if out:
-        print("[WIFI] Visible networks:")
-        for line in out.splitlines():
-            print(f"[WIFI]   {line}")
-    elif err:
-        print(f"[WIFI] Could not list visible networks: {err}")
-
-    print(f"[WIFI] Switching to home WiFi: '{ssid}' ...")
-    for attempt in range(1, retries + 1):
-        print(f"[WIFI] Attempt {attempt}/{retries} using nmcli direct connect...")
-        ok, out, err = connect_using_nmcli(ssid, pwd)
-        if ok:
-            time.sleep(5)
-            if verify_internet():
-                print(f"[WIFI] ✓ Connected to '{ssid}' via nmcli direct connect")
-                return True
-            print("[WIFI] Connected but internet not ready yet.")
-        print(f"[WIFI] nmcli direct failed: {err or out or 'unknown error'}")
-
-        print(f"[WIFI] Attempt {attempt}/{retries} using saved profile...")
-        ok, out, err = connect_using_saved_profile(ssid)
-        if ok:
-            time.sleep(5)
-            if verify_internet():
-                print(f"[WIFI] ✓ Connected to '{ssid}' via saved profile")
-                return True
-            print("[WIFI] Saved profile connected but internet not ready yet.")
-        print(f"[WIFI] Saved profile failed: {err or out or 'unknown error'}")
-
-        print(f"[WIFI] Attempt {attempt}/{retries} using wpa_cli fallback...")
-        ok, out, err = connect_using_wpa_cli(ssid, pwd)
-        if ok:
-            time.sleep(6)
-            if verify_internet():
-                print(f"[WIFI] ✓ Connected to '{ssid}' via wpa_cli")
-                return True
-            print("[WIFI] wpa_cli connected but internet not ready yet.")
-        print(f"[WIFI] wpa_cli failed: {err or out or 'unknown error'}")
-
-        print(f"[WIFI] Attempt {attempt}/{retries} using iwconfig fallback...")
-        ok, out, err = connect_using_iwconfig(ssid, pwd)
-        if ok:
-            time.sleep(6)
-            if verify_internet():
-                print(f"[WIFI] ✓ Connected to '{ssid}' via iwconfig")
-                return True
-            print("[WIFI] iwconfig connected but internet not ready yet.")
-        print(f"[WIFI] iwconfig failed: {err or out or 'unknown error'}")
-
-        if attempt < retries:
-            print("[WIFI] Retrying in 5s...")
-            time.sleep(5)
-
-    print(f"[WIFI] ✗ Could not connect to '{ssid}' after {retries} attempts.")
-    return False
 
 # ──────────────────────────────────────────────
 # Auto-exit students who only scanned entry
@@ -328,8 +95,7 @@ def auto_exit_missing():
 # Session end timer
 # ──────────────────────────────────────────────
 def schedule_session_end():
-    """Background thread: waits until end_time, auto-exits students,
-    switches to home WiFi, sends CSV email, then shuts down."""
+    """Background thread: waits until end_time, auto-exits students, then shuts down."""
     try:
         end_dt = datetime.strptime(course_session['end_time'], '%H:%M').replace(
             year=datetime.now().year,
@@ -356,34 +122,6 @@ def schedule_session_end():
             print("[SESSION] Auto-closing open entries...")
             auto_exit_missing()
 
-            # 2. Switch Pi back to home WiFi
-            wifi_ok = switch_to_home_wifi()
-            if not wifi_ok:
-                print("[EMAIL] Skipping report send because WiFi/internet is unavailable")
-            else:
-                print("[EMAIL] WiFi restored successfully. Internet looks ready.")
-
-            # 3. Send email report
-            if wifi_ok:
-                print("[EMAIL] Preparing attendance report...")
-                try:
-                    today = date.today().strftime('%Y-%m-%d')
-                    with get_db() as conn:
-                        records = conn.execute(
-                            "SELECT * FROM attendance "
-                            "WHERE date=? AND course_name=? AND section=?",
-                            (today, course_session['course_name'],
-                             course_session['section'])
-                        ).fetchall()
-                    csv_content = generate_csv(records)
-                    ok = send_email_report(course_session['email'], csv_content)
-                    if ok:
-                        print(f"[EMAIL] ✓ Report sent to {course_session['email']}")
-                    else:
-                        print("[EMAIL] ✗ Failed to send — check SMTP credentials / network")
-                except Exception as e:
-                    print(f"[EMAIL] ✗ Error: {e}")
-
             print("[SESSION] Shutting down server...")
             print("═" * 40)
             os.kill(os.getpid(), signal.SIGINT)
@@ -402,7 +140,7 @@ def show_course_popup():
     """Blocking tkinter window — fills course_session before Flask starts."""
     root = tk.Tk()
     root.title("Attendance System — Course Setup")
-    root.geometry("500x530")
+    root.geometry("480x400")
     root.resizable(False, False)
     root.configure(bg='#1a1a2e')
 
@@ -438,7 +176,7 @@ def show_course_popup():
         ("Start Time:",    "10:00 AM",    None),
         ("End Time:",      "11:30 AM",    None),
         ("Section:",       "2B",          None),
-        ("Send Email to:", "example@gmail.com", None),
+        ("Send Email to:", "professor@example.com", None),
     ]
 
     entries = []
@@ -449,23 +187,6 @@ def show_course_popup():
         entries.append(e)
 
     course_e, start_e, end_e, section_e, email_e = entries
-
-    wifi_row = len(course_fields)
-    divider(wifi_row, "── Home WiFi (for email after session) ──")
-
-    wifi_fields = [
-        ("WiFi Name:",     "",  None),
-        ("WiFi Password:", "",  '*'),
-    ]
-    wifi_entries = []
-    for j, (label, default, show) in enumerate(wifi_fields):
-        r = wifi_row + 1 + j
-        lbl(frame, label).grid(row=r, column=0, sticky='w', pady=6)
-        e = entry_field(frame, default, show=show)
-        e.grid(row=r, column=1, pady=6, padx=(12, 0))
-        wifi_entries.append(e)
-
-    wifi_e, wpass_e = wifi_entries
 
     err_lbl = tk.Label(root, text='', bg='#1a1a2e', fg='red',
                        font=('Helvetica', 10))
@@ -486,8 +207,6 @@ def show_course_popup():
         end     = end_e.get().strip()
         section = section_e.get().strip()
         email   = email_e.get().strip()
-        wifi    = wifi_e.get().strip()
-        wpass   = wpass_e.get().strip()
 
         if not all([course, start, end, section, email]):
             err_lbl.config(text='All course fields are required!')
@@ -506,8 +225,6 @@ def show_course_popup():
             'section':     section,
             'email':       email,
             'date':        date.today().strftime('%Y-%m-%d'),
-            'wifi_ssid':   wifi,
-            'wifi_pass':   wpass,
         })
 
         print(f"\n[SESSION] Course  : {course}")
@@ -515,8 +232,6 @@ def show_course_popup():
         print(f"[SESSION] Time    : {s24} - {e24}")
         print(f"[SESSION] Email   : {email}")
         print(f"[SESSION] Date    : {course_session['date']}")
-        if wifi:
-            print(f"[SESSION] Home WiFi: {wifi}")
         print()
         root.destroy()
 
@@ -899,10 +614,9 @@ if __name__ == '__main__':
     # 3. Load known faces
     known_encodings, known_ids, known_names = load_known_faces()
 
-    # 4. Schedule auto session-end + auto email
+    # 4. Schedule auto session-end
     schedule_session_end()
 
-    print(f"[INFO] WiFi IF   : {WIFI_IFACE}")
     print(f"[INFO] DB        : {DB_PATH}")
     print(f"[INFO] Starting Flask on http://0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
