@@ -5,6 +5,7 @@ Runs on Raspberry Pi 5 / Raspbian OS
 
 Features:
   - Tkinter popup at startup to configure course session
+  - All students pre-inserted as Absent at session start
   - First scan  = entry time
   - Second scan = exit time (optional — if missing, auto-set to class end_time)
   - 80% attendance rule
@@ -75,6 +76,33 @@ scan_records = {}
 known_encodings, known_ids, known_names = [], [], []
 
 # ──────────────────────────────────────────────
+# Pre-insert all students as Absent at session start
+# ──────────────────────────────────────────────
+def pre_insert_all_absent():
+    """Insert every known student as Absent at session start.
+    This ensures the session appears in send_report.py even if nobody scans."""
+    today = date.today().strftime('%Y-%m-%d')
+    inserted = 0
+    with get_db() as conn:
+        for sid, name in zip(known_ids, known_names):
+            existing = conn.execute(
+                "SELECT id FROM attendance WHERE student_id=? AND date=? "
+                "AND course_name=? AND section=?",
+                (sid, today, course_session['course_name'], course_session['section'])
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    "INSERT INTO attendance "
+                    "(course_name, section, student_id, full_name, date, status) "
+                    "VALUES (?, ?, ?, ?, ?, 'Absent')",
+                    (course_session['course_name'], course_session['section'],
+                     sid, name, today)
+                )
+                inserted += 1
+        conn.commit()
+    print(f"[SESSION] Pre-inserted {inserted} students as Absent")
+
+# ──────────────────────────────────────────────
 # Auto-exit students who only scanned entry
 # ──────────────────────────────────────────────
 def auto_exit_missing():
@@ -87,7 +115,7 @@ def auto_exit_missing():
             status = calculate_status(rec['entry'], end_time_str)
             update_exit_and_status(sid, end_time_str, status)
             scan_records[sid]['exit'] = end_time_str
-            print(f"[AUTO-EXIT] {name} → exit set to {end_time_str} → {status}")
+            print(f"[AUTO-EXIT] {name} -> exit set to {end_time_str} -> {status}")
 
 # ──────────────────────────────────────────────
 # Session end timer
@@ -111,7 +139,7 @@ def schedule_session_end():
 
         def _shutdown():
             end_str = datetime.now().strftime('%H:%M:%S')
-            print("\n" + "═" * 40)
+            print("\n" + "=" * 40)
             print(f"[SESSION] Session ended at {end_str}")
             print(f"[SESSION] Course  : {course_session['course_name']}")
             print(f"[SESSION] Section : {course_session['section']}")
@@ -121,7 +149,7 @@ def schedule_session_end():
             auto_exit_missing()
 
             print("[SESSION] Shutting down server...")
-            print("═" * 40)
+            print("=" * 40)
             os.kill(os.getpid(), signal.SIGINT)
 
         t = threading.Timer(delay, _shutdown)
@@ -472,7 +500,7 @@ def download_csv():
 
 @app.route('/upload', methods=['POST'])
 def upload():
-    SEP = "═" * 40
+    SEP = "=" * 40
     print(SEP)
 
     jpeg_bytes = request.data
@@ -584,7 +612,10 @@ if __name__ == '__main__':
     # 3. Load known faces
     known_encodings, known_ids, known_names = load_known_faces()
 
-    # 4. Schedule auto session-end
+    # 4. Pre-insert ALL students as Absent immediately
+    pre_insert_all_absent()
+
+    # 5. Schedule auto session-end
     schedule_session_end()
 
     print(f"[INFO] DB        : {DB_PATH}")
