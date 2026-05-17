@@ -8,7 +8,7 @@ Features:
   - First scan  = entry time
   - Second scan = exit time (optional — if missing, auto-set to class end_time)
   - 80% attendance rule
-  - CSV export + email report
+  - CSV export + email report (via send_report.py after session)
   - Dashboard with color-coded status
   - Unknown face → clear message sent back to ESP32 HTML + Pi logs
 
@@ -18,7 +18,6 @@ Routes:
   GET      /             — attendance dashboard
   POST     /upload       — receive JPEG from ESP32
   GET      /download_csv — download attendance CSV
-  GET      /send_report  — email the CSV report
 """
 
 import os
@@ -67,7 +66,6 @@ course_session = {
     'start_time':  '',   # 24-h "HH:MM"
     'end_time':    '',   # 24-h "HH:MM"
     'section':     '',
-    'email':       '',
     'date':        '',
 }
 
@@ -114,11 +112,11 @@ def schedule_session_end():
         def _shutdown():
             end_str = datetime.now().strftime('%H:%M:%S')
             print("\n" + "═" * 40)
-            print(f"[SESSION] ⏰ Session ended at {end_str}")
+            print(f"[SESSION] Session ended at {end_str}")
             print(f"[SESSION] Course  : {course_session['course_name']}")
             print(f"[SESSION] Section : {course_session['section']}")
 
-            # 1. Auto-exit students who only scanned entry
+            # Auto-exit students who only scanned entry
             print("[SESSION] Auto-closing open entries...")
             auto_exit_missing()
 
@@ -140,7 +138,7 @@ def show_course_popup():
     """Blocking tkinter window — fills course_session before Flask starts."""
     root = tk.Tk()
     root.title("Attendance System — Course Setup")
-    root.geometry("480x400")
+    root.geometry("480x360")
     root.resizable(False, False)
     root.configure(bg='#1a1a2e')
 
@@ -148,13 +146,10 @@ def show_course_popup():
         return tk.Label(parent, text=text, bg='#1a1a2e', fg='white',
                         font=('Helvetica', 11), **kw)
 
-    def entry_field(parent, default='', show=None):
-        kw = dict(font=('Helvetica', 11), width=26,
-                  bg='#16213e', fg='white', insertbackground='white',
-                  relief='flat', bd=5)
-        if show:
-            kw['show'] = show
-        e = tk.Entry(parent, **kw)
+    def entry_field(parent, default=''):
+        e = tk.Entry(parent, font=('Helvetica', 11), width=26,
+                     bg='#16213e', fg='white', insertbackground='white',
+                     relief='flat', bd=5)
         e.insert(0, default)
         return e
 
@@ -166,27 +161,21 @@ def show_course_popup():
     frame = tk.Frame(root, bg='#1a1a2e')
     frame.pack(padx=35, fill='x')
 
-    def divider(row, text):
-        tk.Label(frame, text=text, bg='#1a1a2e', fg='#00d4ff',
-                 font=('Helvetica', 10, 'bold')).grid(
-            row=row, column=0, columnspan=2, sticky='w', pady=(10, 2))
-
-    course_fields = [
-        ("Course Name:",   "Mathematics", None),
-        ("Start Time:",    "10:00 AM",    None),
-        ("End Time:",      "11:30 AM",    None),
-        ("Section:",       "2B",          None),
-        ("Send Email to:", "professor@example.com", None),
+    fields = [
+        ("Course Name:", "Mathematics"),
+        ("Start Time:",  "10:00 AM"),
+        ("End Time:",    "11:30 AM"),
+        ("Section:",     "2B"),
     ]
 
     entries = []
-    for i, (label, default, show) in enumerate(course_fields):
+    for i, (label, default) in enumerate(fields):
         lbl(frame, label).grid(row=i, column=0, sticky='w', pady=6)
-        e = entry_field(frame, default, show=show)
+        e = entry_field(frame, default)
         e.grid(row=i, column=1, pady=6, padx=(12, 0))
         entries.append(e)
 
-    course_e, start_e, end_e, section_e, email_e = entries
+    course_e, start_e, end_e, section_e = entries
 
     err_lbl = tk.Label(root, text='', bg='#1a1a2e', fg='red',
                        font=('Helvetica', 10))
@@ -206,10 +195,9 @@ def show_course_popup():
         start   = start_e.get().strip()
         end     = end_e.get().strip()
         section = section_e.get().strip()
-        email   = email_e.get().strip()
 
-        if not all([course, start, end, section, email]):
-            err_lbl.config(text='All course fields are required!')
+        if not all([course, start, end, section]):
+            err_lbl.config(text='All fields are required!')
             return
 
         s24 = parse_time(start)
@@ -223,14 +211,12 @@ def show_course_popup():
             'start_time':  s24,
             'end_time':    e24,
             'section':     section,
-            'email':       email,
             'date':        date.today().strftime('%Y-%m-%d'),
         })
 
         print(f"\n[SESSION] Course  : {course}")
         print(f"[SESSION] Section : {section}")
         print(f"[SESSION] Time    : {s24} - {e24}")
-        print(f"[SESSION] Email   : {email}")
         print(f"[SESSION] Date    : {course_session['date']}")
         print()
         root.destroy()
@@ -484,22 +470,6 @@ def download_csv():
     resp.headers['Content-Type'] = 'text/csv'
     return resp
 
-@app.route('/send_report')
-def send_report():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-    today = date.today().strftime('%Y-%m-%d')
-    with get_db() as conn:
-        records = conn.execute(
-            "SELECT * FROM attendance WHERE date=? AND course_name=? AND section=?",
-            (today, course_session['course_name'], course_session['section'])
-        ).fetchall()
-    csv_content = generate_csv(records)
-    ok = send_email_report(course_session['email'], csv_content)
-    return jsonify({'success': ok,
-                    'message': f"Report sent to {course_session['email']}" if ok
-                               else 'Email failed — check SMTP env vars'})
-
 @app.route('/upload', methods=['POST'])
 def upload():
     SEP = "═" * 40
@@ -539,7 +509,7 @@ def upload():
         return "Face recognition failed", 500
 
     if not face_encs:
-        print("[STEP 4] ⚠ No face detected")
+        print("[STEP 4] No face detected")
         print(SEP)
         return "No face detected"
 
@@ -563,7 +533,7 @@ def upload():
               f"(distance: {best_dist:.2f})")
 
         if not matches[best_idx]:
-            msg = "⚠ Unknown Face: This student is not registered in this course"
+            msg = "Unknown Face: This student is not registered in this course"
             print(f"[WARN] {msg} (distance: {best_dist:.2f})")
             print(SEP)
             return msg, 200
@@ -576,18 +546,18 @@ def upload():
             scan_records[sid] = {'entry': now, 'exit': None}
             get_or_create_record(sid, name)
             update_entry_time(sid, now)
-            print(f"[STEP 7] ✓ ENTRY: {name} at {now}")
+            print(f"[STEP 7] ENTRY: {name} at {now}")
             print(SEP)
-            return f"✓ Entry recorded: {name} at {now}"
+            return f"Entry recorded: {name} at {now}"
 
         # ── Second scan = exit ──────────────────────────────────────
         if scan_records[sid]['exit'] is None:
             scan_records[sid]['exit'] = now
             status = calculate_status(scan_records[sid]['entry'], now)
             update_exit_and_status(sid, now, status)
-            print(f"[STEP 7] ✓ EXIT: {name} at {now} → {status}")
+            print(f"[STEP 7] EXIT: {name} at {now} -> {status}")
             print(SEP)
-            return f"✓ Exit recorded: {name} — {status}"
+            return f"Exit recorded: {name} — {status}"
 
         # ── Already complete ────────────────────────────────────────
         print(f"[INFO] {name} already fully recorded")
@@ -595,7 +565,7 @@ def upload():
         return f"Already recorded today: {name}"
 
     print(SEP)
-    return "⚠ Unknown Face: This student is not registered in this course", 200
+    return "Unknown Face: This student is not registered in this course", 200
 
 # ──────────────────────────────────────────────
 # Entry point
